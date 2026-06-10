@@ -504,12 +504,27 @@ def test_flash_attn_fp8_fwd_sm100_partial_descale():
     q_descale = torch.full((batch_size, nheads), 1.5, device=device, dtype=torch.float32)
     k_descale = torch.full((batch_size, nheads), 0.75, device=device, dtype=torch.float32)
     v_descale = torch.full((batch_size, nheads), 2.0, device=device, dtype=torch.float32)
+    identity_descale = torch.ones_like(q_descale)
 
-    out_raw, _ = _flash_attn_fwd(q, k, v, softmax_scale=softmax_scale)
+    out_raw, _ = _flash_attn_fwd(
+        q, k, v, q_descale=identity_descale, softmax_scale=softmax_scale
+    )
     out_q, _ = _flash_attn_fwd(q, k, v, q_descale=q_descale, softmax_scale=softmax_scale)
-    out_q_ref, _ = _flash_attn_fwd(q, k, v, softmax_scale=softmax_scale * q_descale[0, 0].item())
+    out_q_ref, _ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        q_descale=identity_descale,
+        softmax_scale=softmax_scale * q_descale[0, 0].item(),
+    )
     out_k, _ = _flash_attn_fwd(q, k, v, k_descale=k_descale, softmax_scale=softmax_scale)
-    out_k_ref, _ = _flash_attn_fwd(q, k, v, softmax_scale=softmax_scale * k_descale[0, 0].item())
+    out_k_ref, _ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        q_descale=identity_descale,
+        softmax_scale=softmax_scale * k_descale[0, 0].item(),
+    )
     out_v, _ = _flash_attn_fwd(q, k, v, v_descale=v_descale, softmax_scale=softmax_scale)
     out_qv, _ = _flash_attn_fwd(
         q,
@@ -527,6 +542,56 @@ def test_flash_attn_fp8_fwd_sm100_partial_descale():
     assert torch.equal(out_k, out_k_ref)
     assert torch.equal(out_v, (out_raw.float() * v_descale[0, 0].item()).to(torch.bfloat16))
     assert torch.equal(out_qv, (out_q_ref.float() * v_descale[0, 0].item()).to(torch.bfloat16))
+
+
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_fwd_sm100_nonunit_descale():
+    if not IS_SM100:
+        pytest.skip("FA4 CuTe FP8 forward is only supported on SM100")
+
+    device = "cuda"
+    dtype = torch.float8_e4m3fn
+    dtype_ref = torch.bfloat16
+    batch_size = 2
+    seqlen = 256
+    nheads = 4
+    d = 64
+
+    torch.random.manual_seed(0)
+    q_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype_ref)
+    k_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype_ref)
+    v_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype_ref)
+    q_ref, k_ref, v_ref = [x.to(dtype).to(dtype_ref) for x in (q_ref, k_ref, v_ref)]
+    q, k, v = [x.to(dtype) for x in (q_ref, k_ref, v_ref)]
+    q_descale, k_descale, v_descale = [
+        torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 2
+        for _ in range(3)
+    ]
+
+    out_ref, _ = attention_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        None,
+        None,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    out, _ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    if is_fake_mode():
+        return
+
+    torch.testing.assert_close(out, out_ref, atol=0.5, rtol=0.5)
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
