@@ -493,6 +493,24 @@ def _flash_attn_fwd(
             lse.fill_(float("-inf"))
         return out, lse
 
+    if is_fp8 and any(t is not None for t in (q_descale, k_descale, v_descale)):
+        descale_shape = (batch_size, num_head_kv)
+        q_descale = (
+            torch.ones(descale_shape, device=device, dtype=torch.float32)
+            if q_descale is None
+            else q_descale
+        )
+        k_descale = (
+            torch.ones(descale_shape, device=device, dtype=torch.float32)
+            if k_descale is None
+            else k_descale
+        )
+        v_descale = (
+            torch.ones(descale_shape, device=device, dtype=torch.float32)
+            if v_descale is None
+            else v_descale
+        )
+
     if is_fp8:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
             if t is not None:

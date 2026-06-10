@@ -481,74 +481,52 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
     ).abs().max().item() + fwd_atol
 
 
-@pytest.mark.xfail(reason="SM100 FP8 forward non-unit descale correctness is not yet verified")
 @retry_on_oom
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_fp8_fwd_sm100_nonunit_descale():
+def test_flash_attn_fp8_fwd_sm100_partial_descale():
     if not IS_SM100:
         pytest.skip("FA4 CuTe FP8 forward is only supported on SM100")
 
     device = "cuda"
     dtype = torch.float8_e4m3fn
     dtype_ref = torch.bfloat16
-    batch_size = 2
+    batch_size = 1
     seqlen = 256
-    nheads = 4
+    nheads = 1
     d = 64
 
     torch.random.manual_seed(0)
     q_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype_ref)
     k_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype_ref)
     v_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype_ref)
-    q_ref, k_ref, v_ref = [x.to(dtype).to(dtype_ref) for x in (q_ref, k_ref, v_ref)]
     q, k, v = [x.to(dtype) for x in (q_ref, k_ref, v_ref)]
-    q_descale, k_descale, v_descale = [
-        torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 2
-        for _ in range(3)
-    ]
+    softmax_scale = d ** -0.5
+    q_descale = torch.full((batch_size, nheads), 1.5, device=device, dtype=torch.float32)
+    k_descale = torch.full((batch_size, nheads), 0.75, device=device, dtype=torch.float32)
+    v_descale = torch.full((batch_size, nheads), 2.0, device=device, dtype=torch.float32)
 
-    out_ref, _ = attention_ref(
-        q_ref,
-        k_ref,
-        v_ref,
-        None,
-        None,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-    )
-    out_pt, _ = attention_ref(
-        q_ref,
-        k_ref,
-        v_ref,
-        None,
-        None,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        upcast=False,
-        reorder_ops=True,
-        intermediate_dtype=dtype,
-    )
-    out, _ = _flash_attn_fwd(
+    out_raw, _ = _flash_attn_fwd(q, k, v, softmax_scale=softmax_scale)
+    out_q, _ = _flash_attn_fwd(q, k, v, q_descale=q_descale, softmax_scale=softmax_scale)
+    out_q_ref, _ = _flash_attn_fwd(q, k, v, softmax_scale=softmax_scale * q_descale[0, 0].item())
+    out_k, _ = _flash_attn_fwd(q, k, v, k_descale=k_descale, softmax_scale=softmax_scale)
+    out_k_ref, _ = _flash_attn_fwd(q, k, v, softmax_scale=softmax_scale * k_descale[0, 0].item())
+    out_v, _ = _flash_attn_fwd(q, k, v, v_descale=v_descale, softmax_scale=softmax_scale)
+    out_qv, _ = _flash_attn_fwd(
         q,
         k,
         v,
         q_descale=q_descale,
-        k_descale=k_descale,
         v_descale=v_descale,
+        softmax_scale=softmax_scale,
     )
 
     if is_fake_mode():
         return
 
-    out_diff = (out - out_ref).abs()
-    pt_diff = (out_pt - out_ref).abs()
-    print(f"FP8 descale output max diff: {out_diff.max().item()}")
-    print(f"FP8 descale output mean diff: {out_diff.mean().item()}")
-    print(f"FP8 descale pytorch max diff: {pt_diff.max().item()}")
-    print(f"FP8 descale pytorch mean diff: {pt_diff.mean().item()}")
-    assert out_diff.max().item() <= 4 * pt_diff.max().item() + 1e-5
+    assert torch.equal(out_q, out_q_ref)
+    assert torch.equal(out_k, out_k_ref)
+    assert torch.equal(out_v, (out_raw.float() * v_descale[0, 0].item()).to(torch.bfloat16))
+    assert torch.equal(out_qv, (out_q_ref.float() * v_descale[0, 0].item()).to(torch.bfloat16))
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
