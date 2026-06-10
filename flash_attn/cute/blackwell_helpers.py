@@ -17,7 +17,7 @@ def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
         return "tf32"
     if isinstance(op, tcgen05.mma.MmaI8Op):
         return "i8"
-    if isinstance(op, tcgen05.mma.MmaFP8Op):
+    if isinstance(op, (tcgen05.mma.MmaFP8Op, tcgen05.mma.MmaF8F6F4Op)):
         return "f8f6f4"
     if isinstance(op, tcgen05.mma.MmaMXF8Op):
         return "mxf8f6f4"
