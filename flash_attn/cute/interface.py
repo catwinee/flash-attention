@@ -28,6 +28,7 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
+from flash_attn.cute import pipeline_trace as pipeline_trace_utils
 from flash_attn.cute.cute_dsl_utils import (
     get_aux_tensor_metadata,
     get_broadcast_dims,
@@ -334,6 +335,8 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    pipeline_trace: Optional[torch.Tensor] = None,
+    pipeline_trace_mode: str | int = "full",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -350,7 +353,13 @@ def _flash_attn_fwd(
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
+    if aux_tensors is not None and all(t is None for t in aux_tensors):
+        aux_tensors = None
+    pipeline_trace_mode_int = pipeline_trace_utils.normalize_trace_mode(pipeline_trace_mode)
+    if pipeline_trace_mode_int == pipeline_trace_utils.TRACE_MODE_NONE:
+        pipeline_trace = None
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
+    pipeline_trace = maybe_contiguous(pipeline_trace)
     assert q is not None or qv is not None
     assert v is not None
     q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
@@ -447,6 +456,17 @@ def _flash_attn_fwd(
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+    if pipeline_trace is not None:
+        assert arch // 10 in [10, 11], (
+            "pipeline_trace is currently supported only for the regular SM100/SM110 forward kernel"
+        )
+        assert qv is None, "pipeline_trace is not supported for qv/sparse-kv forward"
+        assert pipeline_trace.dtype == torch.int32, "pipeline_trace must be an int32 tensor"
+        if not is_fake_mode():
+            assert pipeline_trace.is_cuda, "pipeline_trace must be on CUDA device"
+        assert pipeline_trace.numel() >= 5 * 16 * 64, (
+            "pipeline_trace must have at least 5 * 16 * 64 int32 elements"
+        )
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
     if arch // 10 not in [8, 12]:
@@ -776,10 +796,14 @@ def _flash_attn_fwd(
         gather_kv_length,
         sparse_kv,
         disable_sparse_kv_bitmask,
+        pipeline_trace is not None,
+        pipeline_trace_mode_int if pipeline_trace is not None else 0,
         fa_logging.get_fa_log_level(),
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
+        if pipeline_trace is not None:
+            pipeline_trace_utils.set_trace_mode(pipeline_trace_mode_int)
         (
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
@@ -820,6 +844,11 @@ def _flash_attn_fwd(
             or v_descale_tensor is not None
             else None
         )
+        pipeline_trace_tensor = (
+            to_cute_tensor(pipeline_trace, assumed_align=4, fully_dynamic=True)
+            if pipeline_trace is not None
+            else None
+        )
 
         sparse_tensors = None
         if normalized_block_sparse_tensors is not None:
@@ -829,6 +858,11 @@ def _flash_attn_fwd(
         aux_tensor_metadata = None
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
+        cute_aux_data_tensors = (
+            None
+            if cute_aux_tensors is None or all(t is None for t in cute_aux_tensors)
+            else cute_aux_tensors
+        )
 
         qv_tensor = to_cute_tensor(qv)
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices)
@@ -1025,7 +1059,8 @@ def _flash_attn_fwd(
                 compile_args.append(descale_tensors_tensor)
             compile_args.extend([
                 sparse_tensors,
-                AuxData(cute_aux_tensors, aux_scalars),
+                pipeline_trace_tensor,
+                AuxData(cute_aux_data_tensors, aux_scalars),
             ])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -1069,6 +1104,11 @@ def _flash_attn_fwd(
                 window_size_right,
             )
         else:
+            aux_data_tensors = (
+                None
+                if aux_tensors is None or all(t is None for t in aux_tensors)
+                else aux_tensors
+            )
             call_args = [
                 q_call,
                 k_call,
@@ -1100,8 +1140,9 @@ def _flash_attn_fwd(
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
-                AuxData(aux_tensors, aux_scalars),
             ])
+            if pipeline_trace is not None:
+                call_args.append(pipeline_trace)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -1347,8 +1388,15 @@ def _flash_attn_bwd(
     aux_scalars: Optional[tuple] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    pipeline_trace: Optional[torch.Tensor] = None,
+    pipeline_trace_mode: str | int = "full",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
+    if aux_tensors is not None and all(t is None for t in aux_tensors):
+        aux_tensors = None
+    pipeline_trace_mode_int = pipeline_trace_utils.normalize_trace_mode(pipeline_trace_mode)
+    if pipeline_trace_mode_int == pipeline_trace_utils.TRACE_MODE_NONE:
+        pipeline_trace = None
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     sparse_q = None
@@ -1451,11 +1499,22 @@ def _flash_attn_bwd(
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    if pipeline_trace is not None:
+        assert arch // 10 in [10, 11] and not use_dedicated_hd256_kernel, (
+            "pipeline_trace is currently supported only for the regular SM100/SM110 backward kernel"
+        )
+        assert pipeline_trace.dtype == torch.int32, "pipeline_trace must be an int32 tensor"
+        if not is_fake_mode():
+            assert pipeline_trace.is_cuda, "pipeline_trace must be on CUDA device"
+        assert pipeline_trace.numel() >= 5 * 32 * 64, (
+            "pipeline_trace must have at least 5 * 32 * 64 int32 elements"
+        )
 
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
+    pipeline_trace = maybe_contiguous(pipeline_trace)
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
@@ -1775,6 +1834,8 @@ def _flash_attn_bwd(
             get_broadcast_dims(k),
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
+            pipeline_trace is not None,
+            pipeline_trace_mode_int if pipeline_trace is not None else 0,
             # Prevent TVM stride poisoning when only one block is present.
             single_q_block,
             single_k_block,
@@ -1815,12 +1876,16 @@ def _flash_attn_bwd(
             get_broadcast_dims(k),
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
+            pipeline_trace is not None,
+            pipeline_trace_mode_int if pipeline_trace is not None else 0,
             # Prevent TVM stride poisoning when only one block is present.
             single_q_block,
             single_k_block,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
+        if pipeline_trace is not None:
+            pipeline_trace_utils.set_trace_mode(pipeline_trace_mode_int)
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
         ]
@@ -1839,6 +1904,16 @@ def _flash_attn_bwd(
             if t is not None else None
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
+        pipeline_trace_tensor = (
+            to_cute_tensor(pipeline_trace, assumed_align=4, fully_dynamic=True)
+            if pipeline_trace is not None
+            else None
+        )
+        cute_aux_data_tensors = (
+            None
+            if cute_aux_tensors is None or all(t is None for t in cute_aux_tensors)
+            else cute_aux_tensors
+        )
         if arch // 10 in [8, 12]:
             flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
             fa_bwd_obj = flash_bwd_obj_cls(
@@ -1952,9 +2027,7 @@ def _flash_attn_bwd(
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
-        # TODO: check @can_implement
-        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
-            fa_bwd_obj,
+        compile_args = [
             q_tensor,
             k_tensor,
             v_tensor,
@@ -1974,14 +2047,22 @@ def _flash_attn_bwd(
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,
-            AuxData(cute_aux_tensors, aux_scalars),
+            pipeline_trace_tensor,
+        ]
+        compile_args.extend([
+            AuxData(cute_aux_data_tensors, aux_scalars),
             sparse_tensors_compile,
             current_stream,
+        ])
+        # TODO: check @can_implement
+        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+            fa_bwd_obj,
+            *compile_args,
             options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
-        _flash_attn_bwd.compile_cache[compile_key](
+        runtime_args = [
             q.detach(),
             k.detach(),
             v.detach(),
@@ -2001,7 +2082,10 @@ def _flash_attn_bwd(
             dQ_semaphore,
             dK_semaphore,
             dV_semaphore,
-            AuxData(aux_tensors, aux_scalars),
+        ]
+        if pipeline_trace is not None:
+            runtime_args.append(pipeline_trace)
+        runtime_args.extend([
             (
                 normalized_block_sparse_tensors.mask_block_cnt,
                 normalized_block_sparse_tensors.mask_block_idx,
@@ -2014,7 +2098,8 @@ def _flash_attn_bwd(
             )
             if normalized_block_sparse_tensors is not None
             else None,
-        )
+        ])
+        _flash_attn_bwd.compile_cache[compile_key](*runtime_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
     if not use_dedicated_hd256_kernel:

@@ -17,6 +17,7 @@ from quack import copy_utils
 # Import data structures from block_sparsity
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.named_barrier import NamedBarrierBwd
+from flash_attn.cute import pipeline_trace
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.utils import AuxData
 
@@ -1216,6 +1217,10 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
     load_Kt=None,
     load_dOt=None,
     tma_copy_bytes_dO=0,
+    mPipelineTrace: Optional[cute.Tensor] = None,
+    trace_n_events: cutlass.Constexpr[int] = 32,
+    trace_max_iterations: cutlass.Constexpr[int] = 64,
+    trace_enabled: cutlass.Boolean | bool = True,
 ):
     """Produce SM100 backward block-sparse Q/dO loads for 1CTA and non-hdim192 2CTA."""
     (
@@ -1245,7 +1250,13 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
         if const_expr(should_load_Q):
             pipeline_Q.producer_acquire(producer_state_Q_LSE, extra_tx_count=tma_copy_bytes_K)
             load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 1, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+            )
             load_Q(first_m_block, producer_state=producer_state_Q_LSE)
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 0, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+            )
             pipeline_Q.producer_commit(producer_state_Q_LSE)
 
             pipeline_LSE.producer_acquire(producer_state_Q_LSE)
@@ -1255,6 +1266,9 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
                     sLSE[None, producer_state_Q_LSE.index],
                     mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                 )
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 4, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+            )
             producer_state_Q_LSE.advance()
 
         if const_expr(should_load_dO):
@@ -1265,9 +1279,21 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
                 else tma_copy_bytes_V,
             )
             load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum))
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 2, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+            )
             load_dO(first_m_block, producer_state=producer_state_dO_dPsum)
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 3, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+            )
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 9, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+            )
             if const_expr(load_dOt is not None):
                 load_dOt(first_m_block, producer_state=producer_state_dO_dPsum)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 0, 8, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+                )
             pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
             pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
@@ -1277,6 +1303,9 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
                     sdPsum[None, producer_state_dO_dPsum.index],
                     mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
                 )
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 5, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+            )
             producer_state_dO_dPsum.advance()
 
         if const_expr(use_2cta_instrs):
@@ -1284,6 +1313,9 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
             assert producer_state_Kt is not None
             pipeline_Kt.producer_acquire(producer_state_Kt)
             load_Kt(tma_bar_ptr=pipeline_Kt.producer_get_barrier(producer_state_Kt))
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 7, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+            )
             pipeline_Kt.producer_commit(producer_state_Kt)
             producer_state_Kt.advance()
 
@@ -1305,11 +1337,17 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
                     assert pipeline_Qt is not None and producer_state_Qt is not None
                     pipeline_Qt.producer_acquire(producer_state_Qt)
                     load_Qt(prev_m_block, producer_state=producer_state_Qt)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 0, 6, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+                    )
                     pipeline_Qt.producer_commit(producer_state_Qt)
                     producer_state_Qt.advance()
 
                 pipeline_Q.producer_acquire(producer_state_Q_LSE)
                 load_Q(m_block, producer_state=producer_state_Q_LSE)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 0, 0, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+                )
                 pipeline_Q.producer_commit(producer_state_Q_LSE)
 
                 pipeline_LSE.producer_acquire(producer_state_Q_LSE)
@@ -1319,6 +1357,9 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
                         sLSE[None, producer_state_Q_LSE.index],
                         mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                     )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 0, 4, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+                )
                 producer_state_Q_LSE.advance()
 
             if const_expr(should_load_dO):
@@ -1327,8 +1368,17 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
                     extra_tx_count=tma_copy_bytes_dO if const_expr(load_dOt is not None) else 0,
                 )
                 load_dO(m_block, producer_state=producer_state_dO_dPsum)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 0, 3, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+                )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 0, 9, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+                )
                 if const_expr(load_dOt is not None):
                     load_dOt(m_block, producer_state=producer_state_dO_dPsum)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 0, 8, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+                    )
                 pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
                 pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
@@ -1338,6 +1388,9 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
                         sdPsum[None, producer_state_dO_dPsum.index],
                         mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
                     )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 0, 5, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+                )
                 producer_state_dO_dPsum.advance()
             prev_m_block = m_block
 
@@ -1346,6 +1399,9 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
                 assert pipeline_Qt is not None and producer_state_Qt is not None
                 pipeline_Qt.producer_acquire(producer_state_Qt)
                 load_Qt(prev_m_block, producer_state=producer_state_Qt)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 0, 6, loop_count, trace_n_events, trace_max_iterations, trace_enabled
+                )
                 pipeline_Qt.producer_commit(producer_state_Qt)
                 producer_state_Qt.advance()
 
@@ -1397,6 +1453,10 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
     # Subtiling factor and bounds
     q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    mPipelineTrace: Optional[cute.Tensor] = None,
+    trace_n_events: cutlass.Constexpr[int] = 32,
+    trace_max_iterations: cutlass.Constexpr[int] = 64,
+    trace_enabled: cutlass.Boolean | bool = True,
 ):
     """Produce SM100 backward block-sparse Q/dO loads for the hdim192 2CTA schedule."""
     (
@@ -1430,7 +1490,13 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
             extra_tx_count=tma_copy_bytes_K,
         )
         load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_Qt))
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 0, 1, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+        )
         load_Q(first_m_block, producer_state=producer_state_Q_Qt)
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 0, 0, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+        )
         pipeline_Q.producer_commit(producer_state_Q_Qt)
         producer_state_Q_Qt.advance()
 
@@ -1442,6 +1508,9 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
                 sLSE[None, producer_state_LSE.index],
                 mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
             )
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 0, 4, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+        )
         producer_state_LSE.advance()
 
         # dOt + V, for dP.T = V @ dO.T
@@ -1450,7 +1519,13 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
             extra_tx_count=tma_copy_bytes_V,
         )
         load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_O_Ot))
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 0, 2, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+        )
         load_dOt(first_m_block, producer_state=producer_state_O_Ot)
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 0, 8, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+        )
         pipeline_dO.producer_commit(producer_state_O_Ot)
         producer_state_O_Ot.advance()
 
@@ -1462,6 +1537,9 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
                 sdPsum[None, producer_state_dPsum.index],
                 mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dPsum),
             )
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 0, 5, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+        )
         producer_state_dPsum.advance()
 
         # Qt, for dK = dS.T @ Q
@@ -1470,13 +1548,22 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
             extra_tx_count=tma_copy_bytes_K,
         )
         load_Qt(first_m_block, producer_state=producer_state_Q_Qt)
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 0, 6, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+        )
         load_Kt(tma_bar_ptr=pipeline_Qt.producer_get_barrier(producer_state_Q_Qt))
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 0, 7, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+        )
         pipeline_Qt.producer_commit(producer_state_Q_Qt)
         producer_state_Q_Qt.advance()
 
         # dO, for dV = P.T @ dO
         pipeline_dO.producer_acquire(producer_state_O_Ot)
         load_dO(first_m_block, producer_state=producer_state_O_Ot)
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 0, 9, Int32(0), trace_n_events, trace_max_iterations, trace_enabled
+        )
         pipeline_dO.producer_commit(producer_state_O_Ot)
         producer_state_O_Ot.advance()
 
@@ -1502,11 +1589,17 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
                     sLSE[None, producer_state_LSE.index],
                     mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
                 )
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 4, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+            )
             producer_state_LSE.advance()
 
             # Q
             pipeline_Q.producer_acquire(producer_state_Q_Qt)
             load_Q(m_block, producer_state=producer_state_Q_Qt)
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 0, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+            )
             pipeline_Q.producer_commit(producer_state_Q_Qt)
             producer_state_Q_Qt.advance()
 
@@ -1518,23 +1611,35 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
                     sdPsum[None, producer_state_dPsum.index],
                     mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dPsum),
                 )
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 5, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+            )
             producer_state_dPsum.advance()
 
             # dOt, for dP.T = V @ dO.T
             pipeline_dO.producer_acquire(producer_state_O_Ot)
             load_dOt(m_block, producer_state=producer_state_O_Ot)
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 8, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+            )
             pipeline_dO.producer_commit(producer_state_O_Ot)
             producer_state_O_Ot.advance()
 
             # Qt, for dK = dS.T @ Q
             pipeline_Qt.producer_acquire(producer_state_Q_Qt)
             load_Qt(m_block, producer_state=producer_state_Q_Qt)
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 6, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+            )
             pipeline_Qt.producer_commit(producer_state_Q_Qt)
             producer_state_Q_Qt.advance()
 
             # dO, for dV = P.T @ dO
             pipeline_dO.producer_acquire(producer_state_O_Ot)
             load_dO(m_block, producer_state=producer_state_O_Ot)
+            pipeline_trace.stamp_gmem(
+                mPipelineTrace, 0, 9, iter_idx, trace_n_events, trace_max_iterations, trace_enabled
+            )
             pipeline_dO.producer_commit(producer_state_O_Ot)
             producer_state_O_Ot.advance()
 

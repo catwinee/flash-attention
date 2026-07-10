@@ -8,7 +8,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute import FastDivmodDivisor
-from cutlass import Float32, Int32, Int64, const_expr
+from cutlass import Float32, Int32, Int64, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
@@ -20,6 +20,7 @@ from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
+from flash_attn.cute import pipeline_trace
 from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -124,6 +125,15 @@ class FlashAttentionBackwardSm100:
         self.q_subtile_factor = q_subtile_factor
         self.kv_subtile_factor = kv_subtile_factor
         assert self.kv_subtile_factor == 1 or self.kv_subtile_factor % self.cta_group_size == 0
+        self.trace_n_events = 32
+        self.trace_max_iterations = 64
+        # Backward trace role/event map:
+        # role 0 load: 0 Q, 1 K, 2 V, 3 legacy dO/dOt, 4 LSE, 5 dPsum,
+        #              6 Qt, 7 Kt, 8 dOt, 9 dO.
+        # role 1 MMA: 0/1 S, 2/3 dP, 4/5 dK, 6/7 dV, 8/9 dQ,
+        #             10-15 legacy wait brackets, 16-31 detailed wait exits.
+        # role 2 compute: 0-7 legacy P/dS/epilogue, 8-27 detailed P/dS stages.
+        # role 3 dQ reduce: 0-3 legacy reduce, 4-15 detailed per-stage reduce.
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -462,7 +472,8 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
-        aux_data: AuxData = AuxData(),
+        mPipelineTrace: Optional[cute.Tensor] = None,
+        aux_data: cutlass.Constexpr = AuxData(),
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -999,6 +1010,7 @@ class FlashAttentionBackwardSm100:
             window_size_left,
             window_size_right,
             tile_sched_params,
+            mPipelineTrace,
             aux_data,
             fastdiv_mods,
             blocksparse_tensors,
@@ -1082,12 +1094,14 @@ class FlashAttentionBackwardSm100:
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         tile_sched_params: ParamsBase,
-        aux_data: AuxData = AuxData(),
+        mPipelineTrace: Optional[cute.Tensor] = None,
+        aux_data: cutlass.Constexpr = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
+        trace_enabled = bidx == 0
         mma_tile_coord_v = bidx % self.cta_group_size
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -1158,11 +1172,11 @@ class FlashAttentionBackwardSm100:
             * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf.ptr,
+            storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar,
         )
 
         # UMMA producers and AsyncThread consumers
@@ -1496,6 +1510,8 @@ class FlashAttentionBackwardSm100:
                 blocksparse_tensors,
                 should_load_Q=True,
                 should_load_dO=True,
+                mPipelineTrace=mPipelineTrace,
+                trace_enabled=trace_enabled,
             )
 
         #  MMA
@@ -1547,6 +1563,8 @@ class FlashAttentionBackwardSm100:
                 TileSchedulerCls,
                 is_leader_cta,
                 blocksparse_tensors,
+                mPipelineTrace,
+                trace_enabled,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1601,6 +1619,8 @@ class FlashAttentionBackwardSm100:
                 aux_data,
                 fastdiv_mods,
                 blocksparse_tensors,
+                mPipelineTrace,
+                trace_enabled,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1622,6 +1642,8 @@ class FlashAttentionBackwardSm100:
                 TileSchedulerCls,
                 mdQ_semaphore,
                 blocksparse_tensors,
+                mPipelineTrace,
+                trace_enabled,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1729,6 +1751,8 @@ class FlashAttentionBackwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         should_load_Q: bool = True,
         should_load_dO: bool = True,
+        mPipelineTrace: Optional[cute.Tensor] = None,
+        trace_enabled: Boolean | bool = True,
     ):
         producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
@@ -1944,7 +1968,15 @@ class FlashAttentionBackwardSm100:
                             extra_tx_count=self.tma_copy_bytes["K"],
                         )
                         load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_Qt))
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 1, first_m_block, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         load_Q(first_m_block, producer_state=producer_state_Q_Qt)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 0, first_m_block, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_Q.producer_commit(producer_state_Q_Qt)
                         producer_state_Q_Qt.advance()
                         # LSE
@@ -1955,6 +1987,10 @@ class FlashAttentionBackwardSm100:
                                 sLSE[None, producer_state_LSE.index],
                                 mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
                             )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 4, first_m_block, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         producer_state_LSE.advance()
 
                         # dOt + V, for dP.T = V @ dO.T
@@ -1963,7 +1999,19 @@ class FlashAttentionBackwardSm100:
                             extra_tx_count=self.tma_copy_bytes["V"],
                         )
                         load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_O_Ot))
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 2, first_m_block, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         load_dOt(first_m_block, producer_state=producer_state_O_Ot)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 3, first_m_block, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 8, first_m_block, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dO.producer_commit(producer_state_O_Ot)
                         producer_state_O_Ot.advance()
                         # dPsum
@@ -1974,6 +2022,10 @@ class FlashAttentionBackwardSm100:
                                 sdPsum[None, producer_state_dPsum.index],
                                 mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dPsum),
                             )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 5, first_m_block, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         producer_state_dPsum.advance()
 
                         # Qt, for dK = dS.T @ Q
@@ -1982,13 +2034,25 @@ class FlashAttentionBackwardSm100:
                             extra_tx_count=self.tma_copy_bytes["K"],
                         )
                         load_Qt(first_m_block, producer_state=producer_state_Q_Qt)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 6, first_m_block, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         load_Kt(tma_bar_ptr=pipeline_Qt.producer_get_barrier(producer_state_Q_Qt))
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 7, first_m_block, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_Qt.producer_commit(producer_state_Q_Qt)
                         producer_state_Q_Qt.advance()
 
                         # dO, for dV = P.T @ dO
                         pipeline_dO.producer_acquire(producer_state_O_Ot)
                         load_dO(first_m_block, producer_state=producer_state_O_Ot)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 9, first_m_block, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dO.producer_commit(producer_state_O_Ot)
                         producer_state_O_Ot.advance()
 
@@ -2003,11 +2067,19 @@ class FlashAttentionBackwardSm100:
                                     sLSE[None, producer_state_LSE.index],
                                     mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
                                 )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 4, m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             producer_state_LSE.advance()
 
                             # Q
                             pipeline_Q.producer_acquire(producer_state_Q_Qt)
                             load_Q(m_block, producer_state=producer_state_Q_Qt)
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 0, m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             pipeline_Q.producer_commit(producer_state_Q_Qt)
                             producer_state_Q_Qt.advance()
 
@@ -2021,23 +2093,47 @@ class FlashAttentionBackwardSm100:
                                         producer_state_dPsum
                                     ),
                                 )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 5, m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             producer_state_dPsum.advance()
 
                             # dOt, for dP.T = V @ dO.T
                             pipeline_dO.producer_acquire(producer_state_O_Ot)
                             load_dOt(m_block, producer_state=producer_state_O_Ot)
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 3, m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 8, m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             pipeline_dO.producer_commit(producer_state_O_Ot)
                             producer_state_O_Ot.advance()
 
                             # Qt, for dK = dS.T @ Q
                             pipeline_Qt.producer_acquire(producer_state_Q_Qt)
                             load_Qt(m_block, producer_state=producer_state_Q_Qt)
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 6, m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             pipeline_Qt.producer_commit(producer_state_Q_Qt)
                             producer_state_Q_Qt.advance()
 
                             # dO, for dV = P.T @ dO
                             pipeline_dO.producer_acquire(producer_state_O_Ot)
                             load_dO(m_block, producer_state=producer_state_O_Ot)
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 3, m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 9, m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             pipeline_dO.producer_commit(producer_state_O_Ot)
                             producer_state_O_Ot.advance()
 
@@ -2055,7 +2151,15 @@ class FlashAttentionBackwardSm100:
                             load_K(
                                 tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE)
                             )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 1, first_m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             load_Q(first_m_block, producer_state=producer_state_Q_LSE)
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 0, first_m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             pipeline_Q.producer_commit(producer_state_Q_LSE)
 
                             # LSE
@@ -2068,6 +2172,10 @@ class FlashAttentionBackwardSm100:
                                         producer_state_Q_LSE
                                     ),
                                 )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 4, first_m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             producer_state_Q_LSE.advance()
 
                         if const_expr(should_load_dO):
@@ -2082,9 +2190,25 @@ class FlashAttentionBackwardSm100:
                                     producer_state_dO_dPsum
                                 )
                             )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 2, first_m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             load_dO(first_m_block, producer_state=producer_state_dO_dPsum)
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 3, first_m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 9, first_m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             if const_expr(load_dOt is not None):
                                 load_dOt(first_m_block, producer_state=producer_state_dO_dPsum)
+                                pipeline_trace.stamp_gmem(
+                                    mPipelineTrace, 0, 8, first_m_block, self.trace_n_events,
+                                    self.trace_max_iterations, trace_enabled
+                                )
                             pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
                             # dPsum
@@ -2097,11 +2221,19 @@ class FlashAttentionBackwardSm100:
                                         producer_state_dO_dPsum
                                     ),
                                 )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 5, first_m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             producer_state_dO_dPsum.advance()
 
                         if const_expr(self.use_2cta_instrs):
                             pipeline_Kt.producer_acquire(producer_state_Kt)
                             load_Kt(tma_bar_ptr=pipeline_Kt.producer_get_barrier(producer_state_Kt))
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 7, first_m_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             pipeline_Kt.producer_commit(producer_state_Kt)
                             producer_state_Kt.advance()
                         #### Main Loop ####
@@ -2110,12 +2242,20 @@ class FlashAttentionBackwardSm100:
                                 if const_expr(load_Qt is not None):
                                     pipeline_Qt.producer_acquire(producer_state_Qt)
                                     load_Qt(m_block - 1, producer_state=producer_state_Qt)
+                                    pipeline_trace.stamp_gmem(
+                                        mPipelineTrace, 0, 6, m_block - 1, self.trace_n_events,
+                                        self.trace_max_iterations, trace_enabled
+                                    )
                                     pipeline_Qt.producer_commit(producer_state_Qt)
                                     producer_state_Qt.advance()
 
                                 # Q (for S)
                                 pipeline_Q.producer_acquire(producer_state_Q_LSE)
                                 load_Q(m_block, producer_state=producer_state_Q_LSE)
+                                pipeline_trace.stamp_gmem(
+                                    mPipelineTrace, 0, 0, m_block, self.trace_n_events,
+                                    self.trace_max_iterations, trace_enabled
+                                )
                                 pipeline_Q.producer_commit(producer_state_Q_LSE)
 
                                 # LSE
@@ -2128,6 +2268,10 @@ class FlashAttentionBackwardSm100:
                                             producer_state_Q_LSE
                                         ),
                                     )
+                                pipeline_trace.stamp_gmem(
+                                    mPipelineTrace, 0, 4, m_block, self.trace_n_events,
+                                    self.trace_max_iterations, trace_enabled
+                                )
                                 producer_state_Q_LSE.advance()
 
                             if const_expr(should_load_dO):
@@ -2138,8 +2282,20 @@ class FlashAttentionBackwardSm100:
                                     else 0,
                                 )
                                 load_dO(m_block, producer_state=producer_state_dO_dPsum)
+                                pipeline_trace.stamp_gmem(
+                                    mPipelineTrace, 0, 3, m_block, self.trace_n_events,
+                                    self.trace_max_iterations, trace_enabled
+                                )
+                                pipeline_trace.stamp_gmem(
+                                    mPipelineTrace, 0, 9, m_block, self.trace_n_events,
+                                    self.trace_max_iterations, trace_enabled
+                                )
                                 if const_expr(load_dOt is not None):
                                     load_dOt(m_block, producer_state=producer_state_dO_dPsum)
+                                    pipeline_trace.stamp_gmem(
+                                        mPipelineTrace, 0, 8, m_block, self.trace_n_events,
+                                        self.trace_max_iterations, trace_enabled
+                                    )
                                 pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
                                 # dPsum
@@ -2152,6 +2308,10 @@ class FlashAttentionBackwardSm100:
                                             producer_state_dO_dPsum
                                         ),
                                     )
+                                pipeline_trace.stamp_gmem(
+                                    mPipelineTrace, 0, 5, m_block, self.trace_n_events,
+                                    self.trace_max_iterations, trace_enabled
+                                )
                                 producer_state_dO_dPsum.advance()
 
                         #### Tail ####
@@ -2159,6 +2319,10 @@ class FlashAttentionBackwardSm100:
                             if const_expr(load_Qt is not None):
                                 pipeline_Qt.producer_acquire(producer_state_Qt)
                                 load_Qt(m_block_max - 1, producer_state=producer_state_Qt)
+                                pipeline_trace.stamp_gmem(
+                                    mPipelineTrace, 0, 6, m_block_max - 1, self.trace_n_events,
+                                    self.trace_max_iterations, trace_enabled
+                                )
                                 pipeline_Qt.producer_commit(producer_state_Qt)
                                 producer_state_Qt.advance()
 
@@ -2211,6 +2375,10 @@ class FlashAttentionBackwardSm100:
                         self.tma_copy_bytes["V"],
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
+                        mPipelineTrace=mPipelineTrace,
+                        trace_n_events=self.trace_n_events,
+                        trace_max_iterations=self.trace_max_iterations,
+                        trace_enabled=trace_enabled,
                     )
                 else:
                     (
@@ -2253,6 +2421,10 @@ class FlashAttentionBackwardSm100:
                         load_Kt=load_Kt,
                         load_dOt=load_dOt,
                         tma_copy_bytes_dO=self.tma_copy_bytes["dO"],
+                        mPipelineTrace=mPipelineTrace,
+                        trace_n_events=self.trace_n_events,
+                        trace_max_iterations=self.trace_max_iterations,
+                        trace_enabled=trace_enabled,
                     )
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
@@ -2299,6 +2471,8 @@ class FlashAttentionBackwardSm100:
         TileSchedulerCls: Callable,
         is_leader_cta: cutlass.Boolean,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mPipelineTrace: Optional[cute.Tensor] = None,
+        trace_enabled: Boolean | bool = True,
     ):
         # [2025-10-21] For reasons I don't understand, putting these partitioning in the main
         # kernel (before warp specialization) is a lot slower tha putting them here.
@@ -2460,13 +2634,41 @@ class FlashAttentionBackwardSm100:
                     # pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
                     # pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
 
-                    for _ in cutlass.range(main_loop_iters, unroll=1):
+                    for iter_idx in cutlass.range(main_loop_iters, unroll=1):
                         # 1) S.T = K @ Q.T
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 10, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 16, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_Q.consumer_wait(consumer_state_Q)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 17, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dQ.sync_object_empty.wait(
                             0, producer_phase_acc
                         )  # dQ tmem overlaps with S
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 11, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 18, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 0, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_qk_fn(B_idx=consumer_state_Q.index)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 1, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_S_P.sync_object_full.arrive(
                             0, pipeline_S_P.producer_mask, cta_group
                         )
@@ -2476,35 +2678,135 @@ class FlashAttentionBackwardSm100:
                         producer_phase_acc ^= 1
 
                         # 2) dP.T = V @ dO.T
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 12, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 19, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dO.consumer_wait(consumer_state_dO)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 20, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_S_P.sync_object_empty.wait(
                             0, producer_phase_acc
                         )  # dP tmem overlaps with S
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 13, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 21, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 2, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_dov_fn(B_idx=consumer_state_dO.index)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 3, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
                         pipeline_dO.consumer_release(consumer_state_dO)
                         consumer_state_dO.advance()
 
                         # 3) dK = dS.T @ Q
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 22, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_Q.consumer_wait(consumer_state_Q)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 23, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 14, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 15, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 24, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 4, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_dsq_fn(B_idx=consumer_state_Q.index, zero_init=not accumulate_dK)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 5, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_Q.consumer_release(consumer_state_Q)
                         consumer_state_Q.advance()
                         accumulate_dK = True
 
                         # 4) dV = P.T @ dO
                         # Note: if dS is written to tmem, P must be written to tmem
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 25, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dO.consumer_wait(consumer_state_dO)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 26, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 6, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=not accumulate_dV)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 7, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dO.consumer_release(consumer_state_dO)
                         consumer_state_dO.advance()
                         accumulate_dV = True
 
                         # 5) dQ = dS @ K
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 14, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 28, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dS.consumer_wait(consumer_state_dS)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 29, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 15, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 30, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 8, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_dsk_fn()
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 9, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                         pipeline_dS.consumer_release(consumer_state_dS)
                         consumer_state_dS.advance()
@@ -2564,11 +2866,39 @@ class FlashAttentionBackwardSm100:
                         else m_block_max - m_block_min - 1
                     )
 
-                    for _ in cutlass.range(main_loop_iters, unroll=1):
+                    for iter_idx in cutlass.range(main_loop_iters, unroll=1):
                         # (1) S.T = K @ Q.T (next)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 10, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 16, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_Q.consumer_wait(consumer_state_Q)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 17, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 11, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 18, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 0, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_qk_fn(B_idx=consumer_state_Q.index)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 1, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_S_P.sync_object_full.arrive(
                             0, pipeline_S_P.producer_mask, cta_group
                         )
@@ -2577,22 +2907,102 @@ class FlashAttentionBackwardSm100:
 
                         # pipeline_dS.consumer_wait(consumer_state_dS)
                         # (2) dK += dS.T @ Q (cur)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 22, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_Qt.consumer_wait(consumer_state_Qt)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 23, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 14, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 15, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 24, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 4, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_dsq_fn(B_idx=consumer_state_Qt.index, zero_init=not accumulate_dK)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 5, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         accumulate_dK = True
                         pipeline_Qt.consumer_release(consumer_state_Qt)
                         consumer_state_Qt.advance()
 
                         # (3) dP.T = V @ dO.T (next)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 12, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 19, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dO.consumer_wait(consumer_state_dO)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 20, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 13, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 2, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_dov_fn(B_idx=consumer_state_dO.index)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 3, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
                         # (5) dQ = dS @ K (cur)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 14, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 28, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dS.consumer_wait(consumer_state_dS)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 29, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 15, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 30, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 8, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_dsk_fn()
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 9, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                         pipeline_dS.consumer_release(consumer_state_dS)
                         consumer_state_dS.advance()
@@ -2601,8 +3011,24 @@ class FlashAttentionBackwardSm100:
 
                         # (4) dV += P.T @ dO (next)
                         producer_phase_acc ^= 1
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 27, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)  # S -> P
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 31, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 6, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 7, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dO.consumer_release(consumer_state_dO)
                         consumer_state_dO.advance()
 
@@ -2618,9 +3044,29 @@ class FlashAttentionBackwardSm100:
                     # -----------------------------------------------------------
                     # pipeline_dS.consumer_wait(consumer_state_dS)
                     # dK += dS.T @ Q
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 22, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     pipeline_Qt.consumer_wait(consumer_state_Qt)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 23, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 24, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 4, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     mma_dsq_fn(B_idx=consumer_state_Qt.index, zero_init=not accumulate_dK)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 5, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     pipeline_Qt.consumer_release(consumer_state_Qt)
                     consumer_state_Qt.advance()
                     # signal to the epilogue that dK is ready
@@ -2628,10 +3074,34 @@ class FlashAttentionBackwardSm100:
                     producer_phase_dKV ^= 1
 
                     # dQ = dS @ K
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 28, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     pipeline_dS.consumer_wait(consumer_state_dS)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 29, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 30, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 31, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 8, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     mma_dsk_fn()
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 9, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                     pipeline_dS.consumer_release(consumer_state_dS)
                     pipeline_Kt.consumer_release(consumer_state_Kt)
@@ -2689,36 +3159,136 @@ class FlashAttentionBackwardSm100:
                     )
 
                     handle_Q_next = handle_Q
-                    for _ in cutlass.range(main_loop_iters, unroll=1):
+                    for iter_idx in cutlass.range(main_loop_iters, unroll=1):
                         # (1) S.T = K @ Q.T
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 10, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 16, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         handle_Q_next = pipeline_Q_consumer.wait_and_advance()
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 11, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 17, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 0, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_qk_fn(B_idx=handle_Q_next.index)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 1, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_S_P.sync_object_full.arrive(
                             0, pipeline_S_P.producer_mask, cta_group
                         )
 
                         # (2) dK += dS.T @ Q
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 14, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 28, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dS.consumer_wait(consumer_state_dS)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 15, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 29, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 4, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 5, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         accumulate_dK = True
                         handle_Q.release()
 
                         # (3) dQ = dS @ K
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 8, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_dsk_fn()
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 9, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                         pipeline_dS.consumer_release(consumer_state_dS)
                         consumer_state_dS.advance()
 
                         # (4) dP = V @ dO.T
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 12, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 19, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dO.consumer_wait(consumer_state_dO)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 20, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 13, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 18, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 2, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_dov_fn(B_idx=consumer_state_dO.index)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 3, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
                         # (5) dV += P.T @ dO
                         producer_phase_acc ^= 1
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 27, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 31, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 6, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 7, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_dO.consumer_release(consumer_state_dO)
                         consumer_state_dO.advance()
 
@@ -2739,14 +3309,38 @@ class FlashAttentionBackwardSm100:
                     # Tail: Remaining dK and dQ
                     # -----------------------------------------------------------
                     # 1) dK += dS.T @ Q
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 28, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     pipeline_dS.consumer_wait(consumer_state_dS)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 29, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 4, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 5, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     # signal to the epilogue that dK is ready
                     pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
                     producer_phase_dKV ^= 1
 
                     # 2) dQ = dS @ K
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 8, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     mma_dsk_fn()
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 9, main_loop_iters, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                     handle_Q.release()
                     pipeline_dS.consumer_release(consumer_state_dS)
@@ -2922,6 +3516,8 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mPipelineTrace: Optional[cute.Tensor] = None,
+        trace_enabled: Boolean | bool = True,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -3107,15 +3703,31 @@ class FlashAttentionBackwardSm100:
                     m_block_oob = m_block >= m_block_max
                 # Prefetch 1 stage of LSE
                 pipeline_LSE.consumer_wait(consumer_state_LSE)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 8, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 tSrLSE_s2r = cute.make_rmem_tensor(tScS_t2r[None, 0, 0, 0].shape, Float32)
                 if const_expr(prefetch_LSE and not self.shuffle_LSE):
                     cute.autovec_copy(tSsLSE[None, 0, 0, 0, consumer_state_LSE.index], tSrLSE_s2r)
 
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 0, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 pipeline_S_P.consumer_wait(consumer_state_S_P_dP)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 1, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 # pipeline_S_P.sync_object_full.wait(0, consumer_phase_S_P_dP)
                 #### TMEM->RMEM (Load S from TMEM)
                 tSrS_t2r = cute.make_rmem_tensor(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 9, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
 
                 if const_expr(self.tile_hdim == 192):
                     # Signal S tmem load completion using pipeline_S_P when hdim 192
@@ -3151,6 +3763,10 @@ class FlashAttentionBackwardSm100:
                         aux_data,
                         fastdiv_mods,
                     )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 10, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
                 check_m_boundary = (m_block + 1) * self.tile_m > seqlen.seqlen_q
@@ -3160,10 +3776,18 @@ class FlashAttentionBackwardSm100:
                     is_full_block=is_full_block,
                     check_m_boundary=check_m_boundary,
                 )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 11, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 # ---------------------------------------------
                 #### P = exp(S - LSE)
                 # ---------------------------------------------
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 12, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 lane_idx = cute.arch.lane_idx()
                 tSrP_r2t_f32 = cute.make_rmem_tensor(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
@@ -3203,6 +3827,10 @@ class FlashAttentionBackwardSm100:
                         tStP_r2t[None, stage, None, None],
                     )
 
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 13, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 cute.arch.fence_view_async_tmem_store()
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
@@ -3211,6 +3839,14 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
                         # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 2, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 14, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 # Normally we'd need syncwarp here since only 1 thread will signal in
                 # consumer_release, but we already have the self.compute_sync_barrier before this
                 pipeline_LSE.consumer_release(consumer_state_LSE)
@@ -3218,14 +3854,42 @@ class FlashAttentionBackwardSm100:
                 # ---------------------------------------------
                 # dS.T = P.T * (dP.T - D)
                 # ---------------------------------------------
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 15, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 pipeline_dPsum.consumer_wait(consumer_state_dPsum)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 3, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 16, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 17, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 pipeline_dP.consumer_wait(consumer_state_S_P_dP)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 4, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 18, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 # pipeline_dP.sync_object_full.wait(0, consumer_phase_S_P_dP)
                 ### Now delayed to after loop
                 # consumer_state_S_P_dP.advance()
                 # consumer_phase_S_P_dP ^= 1
 
                 ##### dS.T = P.T * (dP.T - Psum)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 19, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 for stage in cutlass.range_constexpr(num_stages):
                     tdPrdP_t2r = cute.make_rmem_tensor(tScS_t2r[None, 0, None, None].shape, Float32)
                     cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
@@ -3306,6 +3970,10 @@ class FlashAttentionBackwardSm100:
                     else:
                         cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
 
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 20, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 if const_expr(not self.use_smem_dS_for_mma_dK):
                     cute.arch.fence_view_async_tmem_store()
 
@@ -3324,6 +3992,10 @@ class FlashAttentionBackwardSm100:
                         )
                     cute.autovec_copy(tdPrdS_xchg, tRS_sdS_xchg[None, 0])
 
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 21, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
                 # Normally we'd need syncwarp here since only 1 thread will signal in
@@ -3335,6 +4007,14 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         pipeline_dS.producer_commit(producer_state_dS)
                     producer_state_dS.advance()
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 5, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 22, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
 
                 # 2-CTA: DSMEM copy from sdS_xchg to peer's sdS buffer
                 if const_expr(self.use_2cta_instrs):
@@ -3345,6 +4025,10 @@ class FlashAttentionBackwardSm100:
                         smem_src_ptr = sdS_xchg.iterator
                         # Destination is peer's sdS at our CTA's offset (exchange_stage position)
                         smem_dst_ptr = sdS.iterator + cta_rank_in_cluster * stage_copy_elems
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 2, 24, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             dS_cluster_full_mbar_ptr,
                             stage_copy_bytes,
@@ -3357,6 +4041,10 @@ class FlashAttentionBackwardSm100:
                             stage_copy_bytes,
                             peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
                         )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 2, 25, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
 
             # Final signal for dS smem store completion
             if const_expr(self.use_2cta_instrs and self.tile_hdim == 128):
@@ -3364,10 +4052,22 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         pipeline_dS.producer_commit(producer_state_dS)
                     producer_state_dS.advance()
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 2, 26, Int32(0), self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
 
             # Epilogue
             # Run epilogue if we processed any m_blocks for this n_block
             if process_tile:
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 6, Int32(0), self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 27, Int32(0), self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 if const_expr(not self.use_tma_store):
                     consumer_state_dKV = self.epilogue_dKV(
                         dp_idx,
@@ -3428,6 +4128,10 @@ class FlashAttentionBackwardSm100:
                         mdK_semaphore,
                         "K",
                     )
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 2, 7, Int32(0), self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
             # Zero dK/dV for empty tiles (local attention or block sparsity)
             # When total_m_block_cnt == 0 for block sparsity, no Q tiles contribute to this KV tile
             if const_expr(not self.dKV_postprocess):
@@ -3557,6 +4261,8 @@ class FlashAttentionBackwardSm100:
         TileSchedulerCls: Callable,
         mdQ_semaphore: Optional[cute.Tensor],
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mPipelineTrace: Optional[cute.Tensor] = None,
+        trace_enabled: Boolean | bool = True,
     ):
         num_reduce_threads = cute.arch.WARP_SIZE * len(self.reduce_warp_ids)
         tidx = cute.arch.thread_idx()[0] % num_reduce_threads
@@ -3698,7 +4404,15 @@ class FlashAttentionBackwardSm100:
                         m_block_max=m_block_max,
                     )
                     m_block_oob_upper = m_block >= m_block_max
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 3, 0, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 3, 1, iter_idx, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 # TMEM -> RMEM
                 tdQrdQ_t2r = cute.make_rmem_tensor(tdQrdQ_t2r_shape, Float32)
                 cute.copy(thr_copy_t2r, tdQtdQ_t2r, tdQrdQ_t2r)
@@ -3719,10 +4433,19 @@ class FlashAttentionBackwardSm100:
                 tdQrdQ = cute.make_tensor(tdQrdQ_t2r.iterator, tdQrdQ_shape)
 
                 for stage in cutlass.range_constexpr(cute.size(tdQrdQ, mode=[1])):
+                    reduce_trace_iter = iter_idx * expected_reduce_stages + stage
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 3, 4, reduce_trace_iter, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     smem_idx = dQ_tma_store_producer_state.index
                     tdQsdQ_r2s = tdQsdQ[None, None, smem_idx]
                     tdQrdQ_r2s = cute.make_tensor(tdQrdQ[None, stage].iterator, tdQsdQ_r2s.shape)
                     cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 3, 5, reduce_trace_iter, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_view_async_shared()
                     # semaphore acquire
@@ -3739,15 +4462,35 @@ class FlashAttentionBackwardSm100:
                                 m_block,
                                 n_block_cta_group,
                             )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 3, 6, reduce_trace_iter, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             barrier.wait_eq(
                                 mdQ_semaphore_cur[(m_block, None)].iterator,
                                 tidx,
                                 cta_rank_in_cluster,
                                 lock_value,
                             )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 3, 7, reduce_trace_iter, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                     self.reduce_sync_barrier.arrive_and_wait()
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 3, 8, reduce_trace_iter, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     # Copy from shared memory to global memory
                     if is_tma_warp and not m_block_oob_upper:
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 3, 9, reduce_trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 3, 2, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         with cute.arch.elect_one():
                             copy_utils.cpasync_reduce_bulk_add_f32(
                                 sdQaccum[None, smem_idx].iterator,
@@ -3756,11 +4499,27 @@ class FlashAttentionBackwardSm100:
                             )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 3, 3, iter_idx, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 3, 10, reduce_trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                     elif is_tma_warp:
                         # Drain pending TMA stores so SMEM buffers are safe to reuse
                         cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                     self.reduce_sync_barrier.arrive_and_wait()
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 3, 11, reduce_trace_iter, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     dQ_tma_store_producer_state.advance()
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 3, 12, reduce_trace_iter, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
 
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
                         if m_block > m_block_min:
@@ -3769,6 +4528,10 @@ class FlashAttentionBackwardSm100:
                                 tidx,
                                 cta_rank_in_cluster,
                                 1,
+                            )
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 3, 13, reduce_trace_iter, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
                             )
 
                 if const_expr(self.tile_hdim == 192):
@@ -3793,6 +4556,10 @@ class FlashAttentionBackwardSm100:
                             cta_rank_in_cluster,
                             dq_sem_release_inc,
                         )
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 3, 13, iter_idx * expected_reduce_stages,
+                            self.trace_n_events, self.trace_max_iterations, trace_enabled
+                        )
 
             if process_tile:
                 if is_tma_warp:
@@ -3805,6 +4572,10 @@ class FlashAttentionBackwardSm100:
                         tidx,
                         cta_rank_in_cluster,
                         1,
+                    )
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 3, 14, Int32(0), self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
                     )
 
             if const_expr(

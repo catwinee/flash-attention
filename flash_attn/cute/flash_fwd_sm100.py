@@ -36,6 +36,7 @@ from quack import copy_utils, layout_utils
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
+from flash_attn.cute import pipeline_trace
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
@@ -158,6 +159,8 @@ class FlashAttentionForwardSm100:
         self.q_stage = q_stage
         assert self.q_stage in [1, 2]
         self.use_2cta_instrs = use_2cta_instrs
+        self.trace_n_events = 16
+        self.trace_max_iterations = 64
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
@@ -400,7 +403,8 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_data: AuxData = AuxData(),
+        mPipelineTrace: Optional[cute.Tensor] = None,
+        aux_data: cutlass.Constexpr = AuxData(),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -781,6 +785,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_pv,
             tile_sched_params,
             num_splits,
+            mPipelineTrace,
             aux_data,
             fastdiv_mods,
             head_divmod,
@@ -840,7 +845,8 @@ class FlashAttentionForwardSm100:
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
         num_splits: Int32,
-        aux_data: AuxData = AuxData(),
+        mPipelineTrace: Optional[cute.Tensor] = None,
+        aux_data: cutlass.Constexpr = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
     ):
@@ -892,11 +898,11 @@ class FlashAttentionForwardSm100:
         )
         # Tensor memory dealloc barrier init
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf.ptr,
+            storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar,
         )
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
@@ -1185,6 +1191,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                mPipelineTrace=mPipelineTrace,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1216,6 +1223,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                mPipelineTrace=mPipelineTrace,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1277,6 +1285,7 @@ class FlashAttentionForwardSm100:
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                mPipelineTrace=mPipelineTrace,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1323,6 +1332,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                mPipelineTrace=mPipelineTrace,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1351,6 +1361,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler: TileSchedulerProtocol,
+        mPipelineTrace: Optional[cute.Tensor] = None,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -1367,6 +1378,8 @@ class FlashAttentionForwardSm100:
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.kv_stage
         )
+        bidx, _, _ = cute.arch.block_idx()
+        trace_enabled = bidx == 0
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1493,16 +1506,32 @@ class FlashAttentionForwardSm100:
                         paged_kv_manager.load_page_table(n_block_first)
                     if issue_kv_for_this_warp:
                         load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 0, n_block_max - 1, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                     # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
                     if issue_q_for_this_warp:
                         load_Q(block=0, stage=0)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 2, Int32(0), self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                     if issue_kv_for_this_warp:
                         kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
                         load_Q(block=1, stage=1)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 2, Int32(1), self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                     q_producer_phase ^= 1
                     if issue_kv_for_this_warp:
                         load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 0, 1, n_block_max - 1, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         kv_producer_state.advance()
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
@@ -1516,8 +1545,16 @@ class FlashAttentionForwardSm100:
                     # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
                         if issue_kv_for_this_warp:
                             load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 0, n_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             kv_producer_state.advance()
                             load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 0, 1, n_block, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             kv_producer_state.advance()
 
             else:
@@ -1573,6 +1610,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler=None,
+        mPipelineTrace: Optional[cute.Tensor] = None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1662,6 +1700,8 @@ class FlashAttentionForwardSm100:
             pipeline.PipelineUserType.Consumer, self.kv_stage
         )
         P_full_O_rescaled_phase = Int32(0)
+        bidx, _, _ = cute.arch.block_idx()
+        trace_enabled = bidx == 0
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1695,12 +1735,21 @@ class FlashAttentionForwardSm100:
 
             if process_tile and is_leader_cta:
                 for stage in cutlass.range_constexpr(self.q_stage):
+                    trace_iter = n_block_max - 1
                     # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
                     # 1. wait for Q0 / Q1
                     pipeline_q.consumer_wait_w_index_phase(stage, mma_q_consumer_phase)
                     # 2. wait for K0
                     if const_expr(stage == 0):
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 14, trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 15, trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                     Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tSrKi = tSrK[None, None, None, Ki_index]
                     # We don't need to acquire empty S0 / S1.
@@ -1713,12 +1762,20 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                     # gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, stage, trace_iter, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     gemm_Si[stage](
                         smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
                     )
                     # gemm_Si[stage](tCrB=tSrKi)
                     # 4. release S0 / S1
                     pipeline_s_p_o.producer_commit_w_index(stage)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, stage, trace_iter, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                 mma_q_consumer_phase ^= 1
                 # 5. release K0
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
@@ -1731,9 +1788,18 @@ class FlashAttentionForwardSm100:
                 block_loop_count = block_iter_count - 1
                 O_should_accumulate = False
                 for i in cutlass.range(block_loop_count, unroll=1):
+                    pv_trace_iter = n_block_max - 1 - i
                     # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                     # 1. wait for V0
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 12, pv_trace_iter, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 13, pv_trace_iter, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     mma_kv_release_state = mma_kv_consumer_state.clone()
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tOrVi = tOrV[None, None, None, Vi_index]
@@ -1742,13 +1808,25 @@ class FlashAttentionForwardSm100:
                         # For the first iteration in this work tile, waiting for O0/O1_partial
                         # means that the correction warps has finished reading tO during
                         # the last iteration of the previous work tile.
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 8 + stage, pv_trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 10 + stage, pv_trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         # 3. gemm
                         # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                         # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 2 + stage, pv_trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         gemm_Pi[stage](
                             tCrB=tOrVi,
                             sB=sV_cur,
@@ -1762,6 +1840,10 @@ class FlashAttentionForwardSm100:
                         # warps finished, S_i for the next iteration must have been done, so O_i-1
                         # must have been done as well.
                         # pipeline_o_acc.producer_commit_w_index(stage)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, 2 + stage, pv_trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         # 4. release V(i-1)
                         if const_expr(stage == self.q_stage - 1):
                             pipeline_kv.consumer_release(mma_kv_release_state)
@@ -1772,7 +1854,16 @@ class FlashAttentionForwardSm100:
                         # 1. wait for Ki
                         if const_expr(stage == 0):
                             mma_kv_consumer_state.advance()
+                            qk_trace_iter = n_block_max - 2 - i
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 1, 14, qk_trace_iter, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                             pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                            pipeline_trace.stamp_gmem(
+                                mPipelineTrace, 1, 15, qk_trace_iter, self.trace_n_events,
+                                self.trace_max_iterations, trace_enabled
+                            )
                         Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                         # 2. gemm
                         # Don't need to wait for the softmax warp to have finished reading the previous
@@ -1783,12 +1874,20 @@ class FlashAttentionForwardSm100:
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, stage, n_block_max - 2 - i, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         gemm_Si[stage](
                             smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
                         )
                         # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index])
                         # 3. release S0 / S1
                         pipeline_s_p_o.producer_commit_w_index(stage)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 1, stage, n_block_max - 2 - i, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
                     # 4. release Ki
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
@@ -1803,18 +1902,38 @@ class FlashAttentionForwardSm100:
 
                 # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                 # 1. wait for V0
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 1, 12, n_block_min, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                pipeline_trace.stamp_gmem(
+                    mPipelineTrace, 1, 13, n_block_min, self.trace_n_events,
+                    self.trace_max_iterations, trace_enabled
+                )
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                 tOrVi = tOrV[None, None, None, Vi_index]
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # 2. acquire corrected Oi_partial and Pi
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 8 + stage, n_block_min, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 10 + stage, n_block_min, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     # 3. gemm
                     # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                     # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 2 + stage, n_block_min, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     gemm_Pi[stage](
                         tCrB=tOrVi,
                         sB=sV_cur,
@@ -1829,6 +1948,10 @@ class FlashAttentionForwardSm100:
                     # computing the row sum of the current tile. It does not guarantee that the 1st
                     # tile of the next work tile has been computed yet.
                     pipeline_o_acc.producer_commit_w_index(stage)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 1, 2 + stage, n_block_min, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     # End of GEMM_PV00 (P0 * V0 -> O0_partial)
                 P_full_O_rescaled_phase ^= 1
                 # 5. release Vi_end
@@ -1898,6 +2021,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        mPipelineTrace: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2088,6 +2212,7 @@ class FlashAttentionForwardSm100:
                 aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
+                mPipelineTrace=mPipelineTrace,
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
@@ -2272,6 +2397,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        mPipelineTrace: Optional[cute.Tensor] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2291,6 +2417,8 @@ class FlashAttentionForwardSm100:
         A None mask_fn means the tcgen05.ld.red hardware max is valid.
         """
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        bidx, _, _ = cute.arch.block_idx()
+        trace_enabled = bidx == 0
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
         tScS = tScS[(None, None), 0, 0]  # (128, 128)
@@ -2300,7 +2428,23 @@ class FlashAttentionForwardSm100:
         tScP_shape = (tScS_shape[0], tilePlikeFP32)  # (128, 64)
 
         # Wait for Si
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 2, 0, n_block, self.trace_n_events,
+            self.trace_max_iterations, trace_enabled and stage == 0
+        )
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 3, 0, n_block, self.trace_n_events,
+            self.trace_max_iterations, trace_enabled and stage != 0
+        )
         pipeline_s_p_o.consumer_wait_w_index_phase(stage, mma_si_consumer_phase)
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 2, 1, n_block, self.trace_n_events,
+            self.trace_max_iterations, trace_enabled and stage == 0
+        )
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 3, 1, n_block, self.trace_n_events,
+            self.trace_max_iterations, trace_enabled and stage != 0
+        )
         tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         hw_row_max = Float32(-Float32.inf)
         if const_expr(self.use_ldred_rowmax):
@@ -2346,6 +2490,14 @@ class FlashAttentionForwardSm100:
             # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
         # Notify correction wg that row_max is ready
         # pipeline_sm_stats.producer_commit_w_index(stage)
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 2, 3, n_block, self.trace_n_events,
+            self.trace_max_iterations, trace_enabled and stage == 0
+        )
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 3, 3, n_block, self.trace_n_events,
+            self.trace_max_iterations, trace_enabled and stage != 0
+        )
         sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
@@ -2378,11 +2530,28 @@ class FlashAttentionForwardSm100:
                 if const_expr(i + 1 == split_P_arrive_idx):
                     # Notify mma warp that the 1st half of P is ready
                     cute.arch.fence_view_async_tmem_store()
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 2, 4, n_block, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled and stage == 0
+                    )
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 3, 4, n_block, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled and stage != 0
+                    )
                     pipeline_s_p_o.consumer_release_w_index(stage)
         # Notify mma warp that the 2nd half of P is ready
         cute.arch.fence_view_async_tmem_store()
         if const_expr(self.split_P_arrive > 0):
             cute.arch.sync_warp()
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 2, 2, n_block, self.trace_n_events,
+            self.trace_max_iterations, trace_enabled and stage == 0
+        )
+        pipeline_trace.stamp_gmem(
+            mPipelineTrace, 3, 2, n_block, self.trace_n_events,
+            self.trace_max_iterations, trace_enabled and stage != 0
+        )
+        if const_expr(self.split_P_arrive > 0):
             with cute.arch.elect_one():
                 pipeline_p_lastsplit.producer_commit_w_index(stage)
         else:
@@ -2418,6 +2587,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        mPipelineTrace: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2446,6 +2616,8 @@ class FlashAttentionForwardSm100:
         sm_stats_consumer_phase = Int32(0)
         o_corr_consumer_phase = Int32(0)
         corr_epi_producer_phase = Int32(1)
+        bidx, _, _ = cute.arch.block_idx()
+        trace_enabled = bidx == 0
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -2511,9 +2683,18 @@ class FlashAttentionForwardSm100:
                 tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
                 for i in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.q_stage):
+                        trace_iter = total_block_count - 2 - i
                         # wait for S0 / S1
                         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 4, stage * 3, trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 4, stage * 3 + 1, trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
@@ -2528,6 +2709,10 @@ class FlashAttentionForwardSm100:
                             self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
                         # Notify mma warp that O has been rescaled
                         pipeline_s_p_o.consumer_release_w_index(stage)
+                        pipeline_trace.stamp_gmem(
+                            mPipelineTrace, 4, stage * 3 + 2, trace_iter, self.trace_n_events,
+                            self.trace_max_iterations, trace_enabled
+                        )
                         pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
                     sm_stats_consumer_phase ^= 1
                     # o_corr_consumer_phase ^= 1
@@ -2551,7 +2736,15 @@ class FlashAttentionForwardSm100:
                             learnable_sink_val[stage] = Float32(learnable_sink[q_head_idx])
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 4, stage * 3, n_block_min, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 4, stage * 3 + 1, n_block_min, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
@@ -2598,6 +2791,10 @@ class FlashAttentionForwardSm100:
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
                     pipeline_s_p_o.consumer_release_w_index(stage)
+                    pipeline_trace.stamp_gmem(
+                        mPipelineTrace, 4, stage * 3 + 2, n_block_min, self.trace_n_events,
+                        self.trace_max_iterations, trace_enabled
+                    )
                     if const_expr(not self.use_correction_warps_for_epi):
                         pipeline_o_epi.producer_commit_w_index(stage)
                     # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
